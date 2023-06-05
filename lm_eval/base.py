@@ -301,6 +301,7 @@ class BaseLM(LM):
             inps = []
             cont_toks_list = []
             inplens = []
+            contps = []
 
             padding_length = None
 
@@ -326,6 +327,11 @@ class BaseLM(LM):
                     (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
                     dtype=torch.long,
                 ).to(self.device)
+                contp = torch.tensor(
+                    (context_enc[-1:] +
+                     continuation_enc)[-(self.max_length + 1):][:-1],
+                    dtype=torch.long,
+                ).to(self.device)
                 (inplen,) = inp.shape
 
                 cont = continuation_enc
@@ -343,33 +349,50 @@ class BaseLM(LM):
                             inp.device
                         ),  # [padding_length - seq]
                     ],
+
+                    dim=0,
+                )
+                contp = torch.cat(
+                    [
+                        contp,  # [seq]
+                        torch.zeros(padding_length - len(cont),
+                                    dtype=torch.long).to(
+                                        inp.device),  # [padding_length - seq]
+                    ],
                     dim=0,
                 )
 
                 inps.append(inp.unsqueeze(0))  # [1, padding_length]
+                contps.append(contp.unsqueeze(0))
                 cont_toks_list.append(cont)
                 inplens.append(inplen)
 
+            batched_contps = torch.cat(contps, dim=0)
             batched_inps = torch.cat(inps, dim=0)  # [batch, padding_length
             multi_logits = F.log_softmax(
-                self._model_call(batched_inps), dim=-1
-            ).cpu()  # [batch, padding_length, vocab]
+                self._model_call(batched_inps.to(self.device)).cpu(),
+                dim=-1)  # [batch, padding_length, vocab]
+            uncond_multi_logits = F.log_softmax(
+                self._model_call(batched_contps.to(self.device)).cpu(),
+                dim=-1)  # [batch, padding_length, vocab]
 
-            for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
-                chunk, multi_logits, inps, inplens, cont_toks_list
-            ):
-
+            for (cache_key, _,
+                 _), logits, uncond_logits, inp, inplen, cont_toks in zip(
+                     chunk, multi_logits, uncond_multi_logits, inps, inplens,
+                     cont_toks_list):
+                CFG = float(os.environ['CFG'])
                 # Slice to original seq length
                 contlen = len(cont_toks)
-                logits = logits[inplen - contlen : inplen].unsqueeze(
-                    0
-                )  # [1, seq, vocab]
+                logits = logits[inplen - contlen:inplen].unsqueeze(
+                    0)  # [1, seq, vocab]
+                uncond_logits = uncond_logits[:contlen].unsqueeze(0)
+
+                logits = logits * CFG + uncond_logits * (1 - CFG)
 
                 # Check if per-token argmax is exactly equal to continuation
                 greedy_tokens = logits.argmax(dim=-1)
-                cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
-                    0
-                )  # [1, seq]
+                cont_toks = torch.tensor(
+                    cont_toks, dtype=torch.long).unsqueeze(0)  # [1, seq]
                 max_equal = (greedy_tokens == cont_toks).all()
 
                 # Obtain log-probs at the corresponding continuation token indices
