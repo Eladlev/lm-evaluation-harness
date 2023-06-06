@@ -1,21 +1,21 @@
 import abc
-from typing import Iterable
-import numpy as np
-import random
-import re
-import os
-import json
 import hashlib
+import json
+import os
+import re
+from abc import abstractmethod
+from typing import Iterable
+
 import datasets
-from sqlitedict import SqliteDict
-from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import find_executable_batch_size
+from sqlitedict import SqliteDict
+from tqdm import tqdm
 
-from lm_eval.metrics import mean, weighted_perplexity, weighted_mean, bits_per_byte
 from lm_eval import utils
-from abc import abstractmethod
+from lm_eval.metrics import mean, weighted_perplexity, bits_per_byte
 
 
 class LM(abc.ABC):
@@ -273,16 +273,18 @@ class BaseLM(LM):
         # pull longest context sample from request
         if len(re_ord.get_reordered()) > 0:
             _, context_enc, continuation_enc = re_ord.get_reordered()[0]
-            max_context = len((context_enc + continuation_enc)[-(self.max_length + 1) :][:-1])
+            max_context = len((context_enc + continuation_enc)[-(self.max_length + 1):][:-1])
             if (self.batch_size == 'auto'):
 
                 if override_bs is None:
                     print('Passed argument batch_size = auto. Detecting largest batch size')
-                    @find_executable_batch_size(starting_batch_size=512) # if OOM, then halves batch_size and tries again
+
+                    @find_executable_batch_size(
+                        starting_batch_size=512)  # if OOM, then halves batch_size and tries again
                     def forward_batch(batch_size):
                         test_batch = torch.ones((batch_size, max_context), device=self.device).long()
                         for _ in range(5):
-                            out = F.log_softmax(self._model_call(test_batch), dim = -1).cpu()
+                            out = F.log_softmax(self._model_call(test_batch), dim=-1).cpu()
                         return batch_size
 
                     batch_size = forward_batch()
@@ -295,8 +297,8 @@ class BaseLM(LM):
             adaptive_batch_size = 0 if override_bs is None else override_bs
 
         for chunk in utils.chunks(
-            tqdm(re_ord.get_reordered(), disable=disable_tqdm),
-            self.batch_size if self.batch_size != "auto" else adaptive_batch_size,
+                tqdm(re_ord.get_reordered(), disable=disable_tqdm),
+                self.batch_size if self.batch_size != "auto" else adaptive_batch_size,
         ):
             inps = []
             cont_toks_list = []
@@ -324,7 +326,7 @@ class BaseLM(LM):
 
                 # when too long to fit in context, truncate from the left
                 inp = torch.tensor(
-                    (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                    (context_enc + continuation_enc)[-(self.max_length + 1):][:-1],
                     dtype=torch.long,
                 ).to(self.device)
                 contp = torch.tensor(
@@ -357,7 +359,7 @@ class BaseLM(LM):
                         contp,  # [seq]
                         torch.zeros(padding_length - len(cont),
                                     dtype=torch.long).to(
-                                        inp.device),  # [padding_length - seq]
+                            inp.device),  # [padding_length - seq]
                     ],
                     dim=0,
                 )
@@ -378,8 +380,8 @@ class BaseLM(LM):
 
             for (cache_key, _,
                  _), logits, uncond_logits, inp, inplen, cont_toks in zip(
-                     chunk, multi_logits, uncond_multi_logits, inps, inplens,
-                     cont_toks_list):
+                chunk, multi_logits, uncond_multi_logits, inps, inplens,
+                cont_toks_list):
                 CFG = float(os.environ['CFG'])
                 # Slice to original seq length
                 contlen = len(cont_toks)
@@ -412,6 +414,91 @@ class BaseLM(LM):
 
         return re_ord.get_original(res)
 
+    def cfg_until(self, requests):
+        res = []
+        CFG = 1.5
+        # CFG = float(os.environ['CFG'])
+        print(CFG)
+
+        def _collate(x):
+            toks = self.tok_encode(x[0])
+            return len(toks), x[0]
+
+        def run_until(input, stop):
+            if stop in input:
+                return True
+            else:
+                return False
+            # if torch.all((stop == input[0][-len(stop):])).item():
+            #     return True
+            # return False
+
+        re_ord = utils.Reorderer(requests, _collate)
+        for context, request_args in tqdm(re_ord.get_reordered()):
+            until = request_args["until"]
+            until_enc = self.tok_encode(until)
+            until_enc = torch.tensor(until_enc).to(self.device)
+            # context_enc = torch.tensor(
+            #     [self.tok_encode(context)[self.max_gen_toks - self.max_length :]]
+            # ).to(self.device)
+
+            max_gen_tokens = min(
+                self.max_gen_toks, request_args.get("max_length", self.max_gen_toks)
+            )
+            max_gen_tokens = 200
+            input_ids = torch.tensor(
+                [self.tok_encode(context)]
+            ).to(self.device)
+            output_ids = []
+            # input_ids = input_ids.to(self.device)
+            for i in range(max_gen_tokens):
+                if i == 0:
+                    out = self._model_farward({'input_ids': input_ids.to(self.device), 'use_cache': True})
+                    out_without = self._model_farward(
+                        {'input_ids': input_ids[:, :1].to(self.device), 'use_cache': False})
+                    logits = out.logits
+                    logits_without = out_without.logits
+                    logits_combine = logits[:, -1:, :] * CFG + logits_without * (1 - CFG)
+                    # logits_combine = applay_cfg(, logits_without, generate_kwargs['guidance_scales'])
+                    past_key_values = out.past_key_values
+                else:
+                    attention_mask = torch.ones(
+                        1, past_key_values[0][0].shape[-2] + 1, device=self.device)
+                    out = self._model_farward({'input_ids': torch.as_tensor([[token]], device=self.device),
+                                               'use_cache': True,
+                                               'attention_mask': attention_mask,
+                                               'past_key_values': past_key_values})
+
+                    out_without = self._model_farward(
+                        {'input_ids': torch.as_tensor(torch.tensor([[1] + output_ids]), device=self.device),
+                         'use_cache': False})
+                    logits = out.logits
+                    logits_without = out_without.logits[:, -1:, :]
+                    logits_combine = logits[:, -1:, :] * CFG + logits_without * (1 - CFG)
+                    past_key_values = out.past_key_values
+
+                last_token_logits = logits_combine[0][-1]
+                token = int(torch.argmax(last_token_logits))
+
+                output_ids.append(token)
+
+                if len(output_ids) > until_enc.shape[0] and run_until(
+                        self.tok_decode(output_ids), until):
+                    stopped = True
+                else:
+                    stopped = False
+
+                if stopped:
+                    break
+            del past_key_values
+            s = self.tok_decode(output_ids)
+            # partial caching
+            self.cache_hook.add_partial("cfg_until", (context, {'until': until}), s)
+
+            res.append(s)
+
+        return re_ord.get_original(res)
+
     def greedy_until(self, requests):
         # TODO: implement fully general `until` that handles until that are
         #       multiple tokens or that span multiple tokens correctly
@@ -436,7 +523,7 @@ class BaseLM(LM):
                 primary_until = None
 
             context_enc = torch.tensor(
-                [self.tok_encode(context)[self.max_gen_toks - self.max_length :]]
+                [self.tok_encode(context)[self.max_gen_toks - self.max_length:]]
             ).to(self.device)
 
             max_gen_tokens = min(
@@ -446,7 +533,7 @@ class BaseLM(LM):
                 context_enc, context_enc.shape[1] + max_gen_tokens, primary_until
             )
 
-            s = self.tok_decode(cont[0].tolist()[context_enc.shape[1] :])
+            s = self.tok_decode(cont[0].tolist()[context_enc.shape[1]:])
 
             for term in until:
                 s = s.split(term)[0]
@@ -664,7 +751,7 @@ class Task(abc.ABC):
 
     @utils.positional_deprecated
     def fewshot_context(
-        self, doc, num_fewshot, provide_description=None, rnd=None, description=None
+            self, doc, num_fewshot, provide_description=None, rnd=None, description=None
     ):
         """Returns a fewshot context string that is made up of a prepended description
         (if provided), the `num_fewshot` number of examples, and an appended prompt example.
@@ -684,7 +771,7 @@ class Task(abc.ABC):
             The fewshot context.
         """
         assert (
-            rnd is not None
+                rnd is not None
         ), "A `random.Random` generator argument must be provided to `rnd`"
         assert not provide_description, (
             "The `provide_description` arg will be removed in future versions. To prepend "
@@ -719,13 +806,13 @@ class Task(abc.ABC):
                 fewshotex = [x for x in fewshotex if x != doc][:num_fewshot]
 
             labeled_examples = (
-                "\n\n".join(
-                    [
-                        self.doc_to_text(doc) + self.doc_to_target(doc)
-                        for doc in fewshotex
-                    ]
-                )
-                + "\n\n"
+                    "\n\n".join(
+                        [
+                            self.doc_to_text(doc) + self.doc_to_target(doc)
+                            for doc in fewshotex
+                        ]
+                    )
+                    + "\n\n"
             )
 
         example = self.doc_to_text(doc)
@@ -781,13 +868,13 @@ class PerplexityTask(Task, abc.ABC):
         return []
 
     def fewshot_context(
-        self, doc, num_fewshot, provide_description=None, rnd=None, description=None
+            self, doc, num_fewshot, provide_description=None, rnd=None, description=None
     ):
         assert (
-            num_fewshot == 0
+                num_fewshot == 0
         ), "The number of fewshot examples must be 0 for perplexity tasks."
         assert (
-            rnd is not None
+                rnd is not None
         ), "A `random.Random` generator argument must be provided to `rnd`."
         assert not provide_description, (
             "The `provide_description` arg will be removed in future versions. To prepend "
@@ -868,6 +955,7 @@ class CacheHook:
             return
         hsh = hash_args(attr, req)
         self.dbdict[hsh] = res
+        self.dbdict.commit()
 
 
 class CachingLM:
@@ -896,6 +984,9 @@ class CachingLM:
             # figure out which ones are cached and which ones are new
             for req in requests:
                 hsh = hash_args(attr, req)
+                if 'Marin and his neighbor Nancy' in req[0]:
+                    AA = 2
+                print(hsh)
                 if hsh in self.dbdict:
                     ob = self.dbdict[hsh]
 
@@ -934,6 +1025,7 @@ REQUEST_RETURN_LENGTHS = {
     "loglikelihood": 2,
     "greedy_until": None,
     "loglikelihood_rolling": None,
+    "cfg_until": None
 }
 
 
@@ -961,9 +1053,9 @@ class Request:
 
     def __eq__(self, other):
         return (
-            self.request_type == other.request_type
-            and self.args == other.args
-            and self.index == other.index
+                self.request_type == other.request_type
+                and self.args == other.args
+                and self.index == other.index
         )
 
     def __repr__(self):

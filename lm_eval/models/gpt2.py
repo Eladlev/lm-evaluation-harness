@@ -2,7 +2,8 @@ import torch
 import transformers
 from typing import Optional, Union
 from lm_eval.base import BaseLM
-
+from peft import PeftModel
+from transformers import  LlamaTokenizer
 
 def _get_dtype(
     dtype: Union[str, torch.dtype]
@@ -21,6 +22,8 @@ class HFLM(BaseLM):
         self,
         device="cuda",
         pretrained="gpt2",
+        adapter=None,
+        load_in_4bit: Optional[bool] = False,
         revision="main",
         low_cpu_mem_usage=None,
         subfolder=None,
@@ -57,18 +60,26 @@ class HFLM(BaseLM):
         self.gpt2 = transformers.AutoModelForCausalLM.from_pretrained(
             pretrained,
             load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit,
             low_cpu_mem_usage=low_cpu_mem_usage,
             revision=revision,
             torch_dtype=_get_dtype(dtype),
             trust_remote_code=trust_remote_code,
-        ).to(self.device)
-        self.gpt2.eval()
-
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained if tokenizer is None else tokenizer,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
         )
+        if not(load_in_8bit) and not(load_in_4bit):
+            self.gpt2.to(device)
+        if not(adapter is None):
+            self.gpt2 = PeftModel.from_pretrained(self.gpt2, adapter)
+
+        self.gpt2.eval()
+        if 'llama' in pretrained:
+            self.tokenizer = LlamaTokenizer.from_pretrained(pretrained)
+        else:
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                pretrained if tokenizer is None else tokenizer,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+            )
 
         self.vocab_size = self.tokenizer.vocab_size
 
@@ -131,6 +142,17 @@ class HFLM(BaseLM):
         """
         with torch.no_grad():
             return self.gpt2(inps)[0]
+
+    def _model_farward(self, inps):
+        """
+        inps: a torch tensor of shape [batch, sequence]
+        the size of sequence may vary from call to call
+
+        returns: a torch tensor of shape [batch, sequence, vocab] with the
+        logits returned from the model
+        """
+        with torch.no_grad():
+            return self.gpt2(**inps)
 
     def _model_generate(self, context, max_length, eos_token_id):
         generation_kwargs = {"do_sample": False, "max_length": max_length}

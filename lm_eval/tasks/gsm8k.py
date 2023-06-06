@@ -109,7 +109,7 @@ Q: '''
         """
         # NOTE: The paper implements "verifiers" that assign a score to multiple
         # solutions and output the highest ranked solution.
-        completion = rf.greedy_until(ctx, {"until": [":", "Q:"]})
+        completion = rf.cfg_until(ctx, {"until": 'Q:'})
         return completion
 
     def _extract_answer(self, completion):
@@ -121,10 +121,10 @@ Q: '''
         else:
             return INVALID_ANS
     def _extract_cot_answer(self,completion):
-        match = completion.find('The answer is ')
+        match = completion.find('answer is ')
         if match ==-1:
             return INVALID_ANS
-        match_str = completion[match+len('The answer is '):]
+        match_str = completion[match+len('answer is '):]
         match = match_str.find('.')
         if match ==-1:
             return INVALID_ANS
