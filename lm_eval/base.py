@@ -416,8 +416,7 @@ class BaseLM(LM):
 
     def cfg_until(self, requests):
         res = []
-        CFG = 1.5
-        # CFG = float(os.environ['CFG'])
+        CFG = float(os.environ['CFG'])
         print(CFG)
 
         def _collate(x):
@@ -953,7 +952,7 @@ class CacheHook:
     def add_partial(self, attr, req, res):
         if self.dbdict is None:
             return
-        hsh = hash_args(attr, req)
+        hsh = hash_args(attr, (req[0], req[1]['until']))
         self.dbdict[hsh] = res
         self.dbdict.commit()
 
@@ -984,9 +983,6 @@ class CachingLM:
             # figure out which ones are cached and which ones are new
             for req in requests:
                 hsh = hash_args(attr, req)
-                if 'Marin and his neighbor Nancy' in req[0]:
-                    AA = 2
-                print(hsh)
                 if hsh in self.dbdict:
                     ob = self.dbdict[hsh]
 
