@@ -952,7 +952,7 @@ class CacheHook:
     def add_partial(self, attr, req, res):
         if self.dbdict is None:
             return
-        hsh = hash_args(attr, (req[0], req[1]['until']))
+        hsh = hash_args(attr,req)
         self.dbdict[hsh] = res
         self.dbdict.commit()
 
